@@ -25,11 +25,29 @@ import argparse
 import io
 import json
 import os
-import sqlite3
 import sys
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_REMOVED_SCRIPT_PATHS = []
+for _path in list(sys.path):
+    _resolved = os.path.abspath(_path or os.getcwd())
+    if _resolved == _SCRIPT_DIR:
+        sys.path.remove(_path)
+        _REMOVED_SCRIPT_PATHS.append(_path)
+import sqlite3
+for _path in reversed(_REMOVED_SCRIPT_PATHS):
+    sys.path.insert(0, _path)
+del _path, _resolved, _REMOVED_SCRIPT_PATHS, _SCRIPT_DIR
+
 import time
 from datetime import datetime
 from pathlib import Path
+
+from footscan_pressure_3d import (
+    FrameDecodeOptions,
+    build_pressure_frames,
+    write_pressure_3d_html,
+)
 
 APP_DB = Path(os.environ.get(
     "FOOTSCAN_APP_DB",
@@ -368,6 +386,60 @@ def cmd_watch(args) -> None:
         print("\n감시 종료.")
 
 
+def cmd_visualize3d(args) -> None:
+    meas = get_measurement(args.id)
+    if not meas:
+        print(f"[error] Measurement ID {args.id} was not found.")
+        sys.exit(1)
+
+    blobs = get_frames(args.id)
+    if not blobs:
+        print(f"[error] Measurement ID {args.id} has no frame data.")
+        sys.exit(1)
+
+    measurement_type = args.type
+    if measurement_type == "auto":
+        measurement_type = "static" if len(blobs) <= 1 else "dynamic"
+
+    options = FrameDecodeOptions(
+        rows=args.rows,
+        cols=args.cols,
+        dtype=args.dtype,
+        max_frames=args.max_frames,
+        smooth=not args.no_smooth,
+        normalize=args.normalize,
+    )
+
+    try:
+        frames = build_pressure_frames(blobs, options)
+    except Exception as exc:
+        print(f"[error] Could not decode pressure frames: {exc}")
+        print("        If the sensor grid is fixed, retry with --rows, --cols, and --dtype.")
+        sys.exit(1)
+
+    if measurement_type == "static" and len(frames) > 1:
+        import numpy as _np
+
+        frames = [_np.asarray(frames, dtype=_np.float32).mean(axis=0).round(4).tolist()]
+
+    scan_date = (meas.get("timestamp") or "")[:10] or datetime.now().strftime("%Y-%m-%d")
+    out_path = Path(args.output) if args.output else OUT_DIR / "3d" / f"FootScan3D_{scan_date}_{args.id}.html"
+    write_pressure_3d_html(
+        frames,
+        out_path,
+        title=f"FootScan 3D Pressure - Measurement #{args.id}",
+        measurement={
+            "id": meas.get("id"),
+            "timestamp": (meas.get("timestamp") or "")[:19],
+            "duration_seconds": meas.get("duration_seconds"),
+            "frame_count": meas.get("frame_count"),
+            "memo": meas.get("memo") or "",
+        },
+        measurement_type=measurement_type,
+    )
+    print(f"[done] 3D pressure visualization written to: {out_path}")
+
+
 # ---------------------------------------------------------------------------
 # 진입점
 # ---------------------------------------------------------------------------
@@ -386,8 +458,24 @@ def main():
 
     sub.add_parser("watch", help="새 측정 자동 감시")
 
+    v = sub.add_parser("visualize3d", help="3D 압력분포 등고선 HTML 생성")
+    v.add_argument("--id", type=int, required=True, help="측정 ID (list 명령으로 확인)")
+    v.add_argument("--type", choices=("auto", "static", "dynamic"), default="auto", help="측정 타입")
+    v.add_argument("--rows", type=int, help="센서 그리드 행 수")
+    v.add_argument("--cols", type=int, help="센서 그리드 열 수")
+    v.add_argument("--dtype", default="auto", help="원시 프레임 dtype: auto, <u2, <f4, <u1 등")
+    v.add_argument("--max-frames", type=int, default=240, help="동적 HTML에 포함할 최대 프레임 수")
+    v.add_argument("--output", help="출력 HTML 경로")
+    v.add_argument("--no-smooth", action="store_true", help="3x3 smoothing 비활성화")
+    v.add_argument("--normalize", action="store_true", help="프레임별 압력값을 0..1로 정규화")
+
     args = p.parse_args()
-    {"list": cmd_list, "register": cmd_register, "watch": cmd_watch}[args.cmd](args)
+    {
+        "list": cmd_list,
+        "register": cmd_register,
+        "watch": cmd_watch,
+        "visualize3d": cmd_visualize3d,
+    }[args.cmd](args)
 
 
 if __name__ == "__main__":
